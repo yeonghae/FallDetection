@@ -1,67 +1,84 @@
 import os
 import cv2
-import numpy as np
-from Models.ultralytics.ultralytics import YOLO
-from Models.segment_anything.segment_anything import sam_model_registry, SamPredictor
+import time
 import torch
+import argparse
+import numpy as np
+import glob
+import natsort
+
+from Detection.Utils import ResizePadding
+from CameraLoader import CamLoader, CamLoader_Q
+from DetectorLoader import TinyYOLOv3_onecls, YOLOv7
+
+from PoseEstimateLoader import SPPE_FastPose
+from fn import draw_single
+
+from Track.Tracker import Detection, Tracker
+from ActionsEstLoader import TSSTG
+
+from segment_anything import sam_model_registry, SamPredictor
 import torch.nn.functional as F
 from torchvision.transforms import Compose
-from Models.Depth_Anything.depth_anything.dpt import DepthAnything
-from Models.Depth_Anything.depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
+from Depth_Anything.depth_anything.dpt import DepthAnything
+from Depth_Anything.depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
 
-# YOLOv11 모델 로드
-model = YOLO("yolo11n.pt")
+import json
+import pickle
+import pandas as pd
+import openpyxl
 
-# Segment Anything 모델 로드
-sam_checkpoint = "checkpoints/sam_vit_h_4b8939.pth"  # SAM 체크포인트 경로
-sam_model_type = "vit_h"
-sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-sam.to(device=device)
-sam_predictor = SamPredictor(sam)
+FRAME_STEP = 14  ## 테스트용 임시 !! TMEP
 
-# Depth Anything 모델 로드
-depth_model = DepthAnything.from_pretrained('LiheYoung/depth_anything_vitl14').to(device).eval()
-transform = Compose([
-    Resize(
-        width=518,
-        height=518,
-        resize_target=False,
-        keep_aspect_ratio=True,
-        ensure_multiple_of=14,
-        resize_method='lower_bound',
-        image_interpolation_method=cv2.INTER_CUBIC,
-    ),
-    NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    PrepareForNet(),
-])
+def kpt2bbox(kpt, ex=20):
+    """Get bbox that hold on all of the keypoints (x,y)
+    kpt: array of shape `(N, 2)`,
+    ex: (int) expand bounding box,
+    """
+    return np.array((kpt[:, 0].min() - ex, kpt[:, 1].min() - ex,
+                     kpt[:, 0].max() + ex, kpt[:, 1].max() + ex))
 
-# 입력 및 출력 디렉토리 설정
-INPUT_VIDEO_DIR = "input/prison_falldown_day"
-OUTPUT_IMAGE_DIR = "output/segmentation"
-os.makedirs(OUTPUT_IMAGE_DIR, exist_ok=True)
+def create_folder(path):
+    """
+    Creates a new folder at the specified path if it doesn't already exist.
+    """
+    try:
+        if not os.path.exists(path):
+            os.makedirs(path)
+            return f"Folder created at: {path}"
+        else:
+            return f"Folder already exists at: {path}"
+    except Exception as e:
+        return f"An error occurred: {e}"
 
-# 사람 클래스 ID (YOLO 모델에 따라 다를 수 있음, 일반적으로 COCO 데이터셋에서 0이 사람 클래스)
-PERSON_CLASS_ID = 0
+def check_skel_mode(mode):
+    mode_list = ['SEKLETON_SAVE', 'SEKLETON_LOAD']
+    if mode in mode_list: 
+        return True
+    else: 
+        return False
 
-def adjust_bounding_boxes(masks):
-    adjusted_bboxes = []
-    for mask in masks:
-        # 마스크에서 윤곽선 탐지
-        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            adjusted_bboxes.append((x, y, x + w, y + h))
-    return adjusted_bboxes
+def init_GT_workbook_and_sheet(gt_path=None, m_name="None"):
+    if gt_path == None:
+        return None, None
+
+    wb = openpyxl.load_workbook(gt_path)
+    ws = wb.active
+
+    headers = [m_name+'_Prediction', 'temp_video', 'temp_frame']
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(headers)
+
+    return workbook, sheet
 
 def refine_segmentation_with_points(frame, predictor, input_box):
-    # 바운딩 박스의 중앙점 계산
+    """Refine segmentation using SAM based on the input bounding box."""
     center_x = (input_box[0] + input_box[2]) // 2
     center_y = (input_box[1] + input_box[3]) // 2
     point_coords = np.array([[center_x, center_y]])
-    point_labels = np.array([1])  # 포인트는 포함 영역으로 표시
+    point_labels = np.array([1])
 
-    # Segment Anything에서 포인트와 박스를 동시에 사용
     masks, scores, _ = predictor.predict(
         box=input_box, 
         point_coords=point_coords, 
@@ -69,117 +86,179 @@ def refine_segmentation_with_points(frame, predictor, input_box):
         multimask_output=True
     )
 
-    # 최고 점수 마스크 선택
     best_mask_idx = np.argmax(scores)
     return masks[best_mask_idx]
 
-def calculate_depth_and_color(frame, depth_map, masks):
-    colored_frame = frame.copy()
-    for mask in masks:
-        # 마스크 영역의 뎁스 맵 추출
-        masked_depth = depth_map[mask > 0]
-        if masked_depth.size > 0:
-            avg_depth = np.mean(masked_depth)
+def calculate_mean_depth(box, depth_map):
+    """Calculate mean depth for a bounding box."""
+    x1, y1, x2, y2 = map(int, box)
+    cropped_depth = depth_map[y1:y2, x1:x2]
+    mean_depth = np.mean(cropped_depth)
+    return mean_depth
 
-            # 평균 뎁스값에 따라 색상 설정 (앞일수록 연하고 뒤로 갈수록 진함)
-            intensity = int(255 - (avg_depth / 255.0) * 200)  # 뎁스에 따라 밝기를 반전하여 조정
-            color = (intensity, intensity, 255)  # 연한 파란색에서 진한 파란색으로 변화
+def filter_overlapping_objects(detections, depth_map):
+    """Filter overlapping objects based on depth."""
+    filtered_detections = []
+    for i, det in enumerate(detections):
+        keep = True
+        for j, other_det in enumerate(detections):
+            if i != j:
+                x1, y1, x2, y2 = det[:4]
+                ox1, oy1, ox2, oy2 = other_det[:4]
 
-            # 색상을 마스크 영역에 적용
-            colored_frame[mask > 0] = color
+                inter_x1 = max(x1, ox1)
+                inter_y1 = max(y1, oy1)
+                inter_x2 = min(x2, ox2)
+                inter_y2 = min(y2, oy2)
 
-    return colored_frame
+                inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+                area1 = (x2 - x1) * (y2 - y1)
+                area2 = (ox2 - ox1) * (oy2 - oy1)
+                union_area = area1 + area2 - inter_area
 
-def calculate_iou(box1, box2):
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+                if union_area > 0 and inter_area / union_area > 0.5:
+                    depth1 = calculate_mean_depth((x1, y1, x2, y2), depth_map)
+                    depth2 = calculate_mean_depth((ox1, oy1, ox2, oy2), depth_map)
 
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-    union_area = box1_area + box2_area - inter_area
-    
-    if union_area == 0:
-        return 0
-
-    return inter_area / union_area
-
-def detect_segment_and_depth(input_dir, output_seg_dir, model, predictor, depth_model, transform):
-    for video_name in os.listdir(input_dir):
-        input_path = os.path.join(input_dir, video_name)
-
-        # 비디오 캡처
-        cap = cv2.VideoCapture(input_path)
-        frame_idx = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # YOLO 모델로 탐지 수행
-            results = model(frame, iou=0.5)
-
-            masks = []  # 객체 마스크 저장
-            bboxes = []  # 바운딩 박스 저장
-
-            for result in results[0].boxes:
-                if int(result.cls) == PERSON_CLASS_ID:  # 사람 클래스 필터링
-                    x1, y1, x2, y2 = map(int, result.xyxy[0])
-
-                    # 탐지된 영역의 이미지 및 마스크 생성
-                    predictor.set_image(frame)
-
-                    # Segment Anything 예측 수행 (Refined with points)
-                    input_box = np.array([x1, y1, x2, y2])
-                    mask = refine_segmentation_with_points(frame, predictor, input_box)
-
-                    # 마스크를 frame 크기로 변환
-                    mask_resized = cv2.resize(mask.astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-                    masks.append(mask_resized)
-                    bboxes.append((x1, y1, x2, y2))
-
-            # 마스크 기반 바운딩 박스 조정
-            adjusted_bboxes = adjust_bounding_boxes(masks)
-
-            # 뎁스 이미지 생성
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) / 255.0
-            transformed_frame = transform({'image': frame_rgb})['image']
-            transformed_frame = torch.from_numpy(transformed_frame).unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                depth = depth_model(transformed_frame)
-
-            depth = F.interpolate(depth[None], (frame.shape[0], frame.shape[1]), mode='bilinear', align_corners=False)[0, 0]
-            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
-
-            depth_map = depth.cpu().numpy().astype(np.uint8)
-
-            # 마스크된 객체에 따라 뎁스 기반 색상 적용
-            colored_frame = calculate_depth_and_color(frame, depth_map, masks)
-
-            # 조정된 바운딩 박스를 원본 이미지에 추가
-            for i, bbox in enumerate(adjusted_bboxes):
-                color = (0, 255, 0)  # 기본 초록색
-                for j, other_bbox in enumerate(adjusted_bboxes):
-                    if i != j and calculate_iou(bbox, other_bbox) > 0.3:  # IoU가 0.5 이상이면 겹침으로 판단
-                        color = (0, 0, 255)  # 빨간색으로 변경
+                    if depth1 > depth2:
+                        keep = False
                         break
-                x1, y1, x2, y2 = bbox
-                cv2.rectangle(colored_frame, (x1, y1), (x2, y2), color, 2)
+        if keep:
+            filtered_detections.append(det)
+    return filtered_detections
 
-            # 결과 이미지 저장
-            seg_output_path = os.path.join(output_seg_dir, f"{os.path.splitext(video_name)[0]}_frame_{frame_idx}.png")
-            cv2.imwrite(seg_output_path, colored_frame)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-            frame_idx += 1
+def preproc(image):
+    resize_fn = ResizePadding(args.detection_input_size, args.detection_input_size)
+    image = resize_fn(image)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
 
-        cap.release()
-        print(f"Processed video: {video_name}")
+def run_with_depth(source_path, model_path, out_dir="_ret", 
+                   bb_load=False,
+                   skeldir="skel", skel_mode=None, sheet=None, workbook=None):
+    if check_skel_mode(skel_mode) == False:
+        print("This mode is not supported.")
+        return -1
 
-if __name__ == "__main__":
-    detect_segment_and_depth(INPUT_VIDEO_DIR, OUTPUT_IMAGE_DIR, model, sam_predictor, depth_model, transform)
+    cam_source = source_path.replace('\\', '/')
+    video_name = source_path.split('/')[-1].split('.')[0]
+    model_name = model_path.split('/')[-1].split('.')[0]
+
+    mout_dir = os.path.join(out_dir, model_name)
+    vout_dir = os.path.join(mout_dir, video_name)
+    viout_dir = os.path.join(vout_dir, 'img')
+    create_folder(viout_dir)
+
+    sam_checkpoint = "sam_vit_h_4b8939.pth"
+    sam_model_type = "vit_h"
+    sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+    sam.to(device=args.device)
+    sam_predictor = SamPredictor(sam)
+
+    depth_model = DepthAnything.from_pretrained('LiheYoung/depth_anything_vitl14').to(device).eval()
+    transform = Compose([
+        Resize(
+            width=518,
+            height=518,
+            resize_target=False,
+            keep_aspect_ratio=True,
+            ensure_multiple_of=14,
+            resize_method='lower_bound',
+            image_interpolation_method=cv2.INTER_CUBIC,
+        ),
+        NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        PrepareForNet(),
+    ])
+
+    cam = CamLoader_Q(cam_source, queue_size=10000, preprocess=preproc).start()
+    time.sleep(1)
+
+    detect_model = YOLOv7(args.detection_input_size, device=args.device)
+    pose_model = SPPE_FastPose(args.pose_backbone, int(args.pose_input_size.split('x')[0]), int(args.pose_input_size.split('x')[1]), device=args.device)
+    action_model = TSSTG(weight_file=model_path)
+
+    while cam.grabbed():
+        frame = cam.getitem()
+        transformed_frame = transform({'image': frame / 255.0})['image']
+        transformed_frame = torch.from_numpy(transformed_frame).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            depth = depth_model(transformed_frame)
+
+        depth = F.interpolate(depth[None], (frame.shape[0], frame.shape[1]), mode='bilinear', align_corners=False)[0, 0]
+        depth_map = depth.cpu().numpy()
+
+        detected = detect_model.detect(frame, need_resize=False, expand_bb=10)
+
+        if detected is not None:
+            filtered_detections = filter_overlapping_objects(detected, depth_map)
+
+            for det in filtered_detections:
+                x1, y1, x2, y2 = map(int, det[:4])
+                input_box = np.array([x1, y1, x2, y2])
+                sam_predictor.set_image(frame)
+                mask = refine_segmentation_with_points(frame, sam_predictor, input_box)
+                mask_resized = cv2.resize(mask.astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                segmented_person = cv2.bitwise_and(frame, frame, mask=mask_resized)
+
+                poses = pose_model.predict(segmented_person, torch.tensor([[x1, y1, x2, y2, 0.9, 1.0, 0]], dtype=torch.float32)[:, :4], torch.tensor([[0.9]], dtype=torch.float32))
+
+                for ps in poses:
+                    pass  # Handle pose and action recognition logic
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cam.stop()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    testdata_dir = 'Dataset/test/'
+    gt_path = 'Dataset/prison_test_data/GT.xlsx'
+
+    vtypes = ['*.mp4', '*.avi']
+    video_list = []
+    for vt in vtypes:
+        video_list.extend(glob.glob(os.path.join(testdata_dir, vt)))
+    video_list = natsort.natsorted(video_list)
+
+    model_dir = 'Models/falldown'
+    base_fn = "__Fall200_Normal200_EP300_BS256_LS4"
+
+    model_path = os.path.join(model_dir, base_fn+'.pth')
+
+    out_path = '_ret'
+
+    m_name = model_path.split('/')[-1].split('.')[0]
+
+    workbook, sheet = init_GT_workbook_and_sheet(gt_path=gt_path, m_name=m_name)
+
+    skel_mode = 'SEKLETON_SAVE'
+
+    if skel_mode == 'SEKLETON_SAVE':
+        skeldir = '_ret'
+    elif skel_mode == 'SEKLETON_LOAD':
+        skeldir = 'Dataset/skeleton'       
+    else:
+        print("skel mode err")
+        exit()
+
+    skel = "test"
+    skeldir = os.path.join(skeldir, skel)
+
+    for vid in video_list:
+        v_name = vid.split('/')[-1].split('.')[0]
+        outv_name = v_name + "_" + m_name + ".mp4"
+
+        par = argparse.ArgumentParser(description='Human Fall Detection Demo.')
+        par.add_argument('--detection_input_size', type=int, default=1088, help='Size of input in detection model in square must be divisible by 32 (int).')
+        par.add_argument('--pose_input_size', type=str, default='288x160', help='Size of input in pose model must be divisible by 32 (h, w)')
+        par.add_argument('--pose_backbone', type=str, default='resnet50', help='Backbone model for SPPE FastPose model.')
+        par.add_argument('--show_skeleton', default=True, action='store_true', help='Show skeleton pose.')
+        par.add_argument('--save_out', type=str, default=outv_name, help='Save display to video file.')
+        par.add_argument('--device', type=str, default='cuda', help='Device to run model on cpu or cuda.')
+        args = par.parse_args()
+
+        run_with_depth(source_path=vid, model_path=model_path, out_dir=out_path, skel_mode=skel_mode, skeldir=skeldir, workbook=workbook, sheet=sheet)
