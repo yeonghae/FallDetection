@@ -8,3 +8,6 @@ checkpoints
 
 Depth-Anything
  - https://github.com/LiheYoung/Depth-Anything.git
+
+Models/sppe
+ - https://drive.google.com/drive/folders/1Zb0_egwcEgWkIn4nQbFXfuWU_YNueJJC?usp=drive_link
