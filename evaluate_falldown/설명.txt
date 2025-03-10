@@ -1,0 +1,69 @@
+.
+|-- Dockerfile : 도커 이미지 구성 파일
+|-- calculate.py : 정확도 계산 스크립트
+|-- calculate_result.json : 정확도 계산 결과
+|-- checkpoint : 가중치 저장 디렉토리
+|   |-- falldown_checkpoint.pth : 낙상 탐지 모델 가중치
+|   `-- rtmo_checkpoint.pth : RTMO 모델 가중치
+|-- dataset : 테스트 데이터셋 디렉토리
+|   |-- labels : 정답 라벨 디렉토리
+|   |-- skeletons : preprocess.py로 추출한 스켈레톤 파일
+|   |   |-- day : 주간 영상에서 추출한 스켈레톤 파일
+|   |   `-- night : 야간 영상에서 추출한 스켈레톤 파일
+|   `-- videos : 테스트 영상 디렉토리
+|       |-- day : 주간 영상
+|       `-- night : 야간 영상
+|-- evaluate.py : 스켈레톤에서 포즈 탐지하는 스크립트, result 디렉토리에 결과 저장
+|-- model.py : 기존 Falldown 스크립트
+|-- module : 낙상 모델 관련 디렉토리
+|   |-- Loader.py
+|   |-- Models.py
+|   |-- Utils.py
+|   |-- __init__.py
+|   `-- __pycache__
+|-- preprocess.py : RTMO 모델을 사용해 영상에서 스켈레톤 포즈 데이터 추출하는 스크립트, dataset/skeletons에 결과 저장
+`-- result : 스켈레톤에서 탐지한 포즈 저장 디렉토리
+    |-- day : 주간 영상에서 탐지된 포즈
+    `-- nigh : 야간 영상에서 탐지된 포즈
+
+실행 방법:
+
+1. preprocess.py 파일을 실행하여 영상으로부터 스켈레톤 추출
+- python preprocess.py
+- 이 과정은 이미 진행되었으므로 건너뛰어도됨
+
+2. evaluate.py 파일을 실행하여 스켈레톤에서 포즈 추출
+- python evaluate.py
+- 이 과정에서 포즈(라벨)이 생성되므로 라벨(normal, falldown)을 판단하는 부분에 수정이 필요함
+- evaluate.py line 127:138
+
+3. calculate.py 파일을 실행하여 정확도 계산
+- python calculate.py
+- 결과는 calculate_result.json으로 저장
+
+{
+    "summary": {
+        "day": { : 주간 영상 정확도 요약
+            "total": 225, : 주간 영상 갯수
+            "accuracy": 0.03331785516860136 : 주간 영상 정확도 평균
+        },
+        "night": { : 야간 영상 정확도 요약
+            "total": 225, : 야간 영상 갯수
+            "accuracy": 0.03331785516860136 : 야간 영상 정확도 평균
+        }
+    },
+    "day": [ : 주간 영상 상세
+        {
+            "video": "dataset/day/falldown_multi_177.mp4", : 주간 영상
+            "accuracy": 0.03333333333333333 : 해당 주간 영상 정확도
+        },
+        ...
+    ],
+    "night": [ : 야간 영상 상세
+        {
+            "video": "dataset/night/falldown_multi_177.mp4", : 야간 영상
+            "accuracy": 0.03333333333333333 : 해당 야간 영상 정확도
+        },
+        ...
+    ],
+}
