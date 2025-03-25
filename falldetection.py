@@ -17,8 +17,7 @@ from fn import draw_single
 from Track.Tracker import Detection, Tracker
 from ActionsEstLoader import TSSTG
 
-from FastSAM.fastsam import FastSAM, FastSAMPrompt
-from FastSAM.utils.tools import convert_box_xywh_to_xyxy 
+from ultralytics import FastSAM
 
 import json
 import pickle
@@ -78,111 +77,6 @@ def init_GT_workbook_and_sheet(gt_path=None, m_name="None"):
     sheet.append(headers)
 
     return workbook, sheet
-
-def segment_person(frame, detected):
-    """
-    객체 탐지된 바운딩 박스 내부에서만 세그멘테이션을 적용하여 배경 제거.
-    
-    Args:
-        image: 입력 영상 프레임
-        detected: YOLOv7 탐지 결과 (바운딩 박스 좌표)
-
-    Returns:
-        List of segmented images: 탐지된 사람 영역을 분리한 이미지 리스트
-    """
-    image = frame.copy()
-    global_mask = np.zeros(image.shape[:2], dtype=np.uint8)
-
-    
-    segmented_images = []
-    MIN_BBOX_SIZE = 30  # 너무 작은 바운딩 박스는 필터링
-
-    DEVICE = "CUDA"
-
-    if detected is None or len(detected) == 0:
-        print("Yolo did not return any results.")
-        return image
-    
-    #print bbox
-    # debug_image = image.copy()
-    # for bbox in detected:
-    #     xmin,ymin,xmax,ymax = map(int, bbox[:4])
-    #     cv2.rectangle(debug_image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-    # cv2.imwrite("debug_bbox.jpg", debug_image)
-
-    everything_results = fastsam_model(
-        image,
-        device=DEVICE,
-        retina_masks=True,
-        conf=0.7,
-        iou=0.85
-    )
-
-    if not everything_results[0]:
-        print("FastSAM did not return any results.")
-        return image
-    if everything_results[0].masks is None:
-        print("FastSAM masks is None.")
-        return image
-    
-    #results of fastsam
-    # maskss = everything_results[0].masks.data.cpu().numpy()
-    # for i,mask in enumerate(maskss):
-    #     mask_vis = (mask * 255).astype(np.uint8)
-    #     cv2.imwrite(f"debug_mask_{i}.jpg", mask_vis)
-
-    # masks = everything_results[0].masks.data if hasattr(everything_results[0].masks, 'data') else everything_results[0].masks
-    # mask_data = masks.cpu().numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
-
-    prompt_process = FastSAMPrompt(image, everything_results[0], device=DEVICE)
-
-    for bbox in detected:
-        bbox = list(map(int, bbox[:4]))
-        xmin, ymin, xmax, ymax = bbox
-
-        width, height = xmax - xmin, ymax - ymin
-
-        xmin = max(0, xmin)
-        ymin = max(0, ymin)
-        xmax = min(image.shape[1], xmax)
-        ymax = min(image.shape[0], ymax)
-
-        # 바운딩 박스 크기가 너무 작으면 제외
-        if width < MIN_BBOX_SIZE or height < MIN_BBOX_SIZE:
-            continue
-
-        # print(f"Checking YOLO BBox: {bbox}")
-
-        try:
-            masks = prompt_process.box_prompt(bbox=[xmin,ymin,xmax,ymax])
-
-            if masks.size == 0:
-                print(f"FastSAM did not return any masks for BBox: {bbox}")
-                continue
-
-            for i in range(masks.shape[0]):
-                mask = masks[0].astype(np.uint8) * 255
-
-                h, w = image.shape[:2]
-                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-                global_mask = cv2.bitwise_or(global_mask, mask)
-                cv2.imwrite("debug_global_mask.jpg", global_mask)
-
-        except Exception as e:
-            print(f"FastSAM Error! BBox: {bbox},e:{e}")
-
-    segmented_images = cv2.bitwise_and(image, image, mask=global_mask)
-    cv2.imwrite("segmented.jpg", segmented_images)
-
-    if len(segmented_images.shape) == 2:  # 흑백 (H, W)
-        segmented_images = cv2.cvtColor(segmented_images, cv2.COLOR_GRAY2BGR)
-    elif segmented_images.shape[2] == 1:  # 단일 채널 (H, W, 1)
-        segmented_images = cv2.cvtColor(segmented_images, cv2.COLOR_GRAY2BGR)
-
-    return segmented_images
-
-
 
 def run(source_path, model_path, out_dir="_ret", 
         bb_load=False,
@@ -276,6 +170,9 @@ def run(source_path, model_path, out_dir="_ret",
                 action = 'pending..'
                 action_name = 'pending..'
 
+                # print("if len (track.keypoints)")
+                # print(len(track.keypoints_list))
+                # Use 30 frames time-steps to prediction.
                 if len(track.keypoints_list) == FRAME_STEP:
                     pts = np.array(track.keypoints_list, dtype=np.float32)
                     # print(f'shape of pts:{pts.shape()}')
@@ -344,7 +241,6 @@ def run(source_path, model_path, out_dir="_ret",
         while cam.grabbed():
             f += 1
             frame = cam.getitem()
-            # cv2.imwrite(f"{f}.jpg", frame)
             image = frame.copy()
 
             
@@ -374,6 +270,11 @@ def run(source_path, model_path, out_dir="_ret",
                 # Predict each tracks bbox of current frame from previous frames information with Kalman filter.
                 tracker.predict()
 
+                # # Merge two source of predicted bbox together.
+                # for track in tracker.tracks:
+                #     det = torch.tensor([track.to_tlbr().tolist() + [0.5, 1.0, 0.0]], dtype=torch.float32)
+                #     detected = torch.cat([detected, det], dim=0) if detected is not None else det
+                
                 detections = []  # List of Detections object for tracking.
                 if detected is not None:
                     # Predict skeleton pose of each bboxs.
@@ -399,26 +300,14 @@ def run(source_path, model_path, out_dir="_ret",
                 
                 detections = []  # List of Detections object for tracking.
                 if detected is not None:
-                    # 세그멘테이션 적용
-                    segmented_results = segment_person(frame, detected)
+                    # Predict skeleton pose of each bboxs.
+                    poses = pose_model.predict(frame, detected[:, 0:4], detected[:, 4])
 
-                    # for seg_img in segmented_results:
-                        # bbox_tensor = torch.tensor([bbox], dtype=torch.float32)[:, 0:4]
-                    
-                    seg_img = segment_person(frame, detected)
-
-                    if len(seg_img.shape) == 2 or seg_img.shape[2] == 1:
-                        seg_img = cv2.cvtColor(seg_img, cv2.COLOR_GRAY2BGR)
-                        
-                        # Predict skeleton pose of each segmented person image
-                    poses = pose_model.predict(seg_img, detected[:, 0:4], detected[:, 4])
-
-                    # Create Detections object
-                    detections.extend([
-                        Detection(kpt2bbox(ps['keypoints'].numpy()),
-                                np.concatenate((ps['keypoints'].numpy(), ps['kp_score'].numpy()), axis=1),
-                                ps['kp_score'].mean().numpy()) for ps in poses
-                    ])
+                    # Create Detections object.
+                    detections = [Detection(kpt2bbox(ps['keypoints'].numpy()),
+                                            np.concatenate((ps['keypoints'].numpy(),
+                                                            ps['kp_score'].numpy()), axis=1),
+                                            ps['kp_score'].mean().numpy()) for ps in poses]
 
             # for dump with pkl
             detections_dict[f] = detections
@@ -427,7 +316,8 @@ def run(source_path, model_path, out_dir="_ret",
             # create a new track if no matched.
             tracker.update(detections)
 
-            for track in tracker.tracks:
+            # Predict Actions of each track.
+            for i, track in enumerate(tracker.tracks):
                 if not track.is_confirmed():
                     continue
 
@@ -435,27 +325,31 @@ def run(source_path, model_path, out_dir="_ret",
                 bbox = track.to_tlbr().astype(int)
                 center = track.get_center().astype(int)
 
+                action = 'pending..'
                 action_name = "pending.."
-                clr = (0, 255, 0)
 
+                clr = (0, 255, 0)
+                
                 if len(track.keypoints_list) == FRAME_STEP:
                     pts = np.array(track.keypoints_list, dtype=np.float32)
                     out = action_model.predict(pts, frame.shape[:2])
                     action_name = action_model.class_names[out[0].argmax()]
-                    
+                    action = '{}: {:.2f}%'.format(action_name, out[0].max() * 100)
+
                     if action_name == 'Fall Down':
                         clr = (255, 0, 0)
                     elif action_name == 'Lying Down':
                         clr = (255, 200, 0)
 
-                # 바운딩 박스 및 스켈레톤 표시
-                if args.show_skeleton:
-                    frame = draw_single(frame, track.keypoints_list[-1])
-                frame = cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), clr, 2)
-                frame = cv2.putText(frame, action_name, (bbox[0], bbox[1] - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, clr, 2)
-
-
+                # VISUALIZE.
+                if track.time_since_update == 0:
+                    if args.show_skeleton:
+                        frame = draw_single(frame, track.keypoints_list[-1])
+                    frame = cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 1)
+                    frame = cv2.putText(frame, str(track_id), (center[0], center[1]), cv2.FONT_HERSHEY_COMPLEX,
+                                        0.4, (255, 0, 0), 2)
+                    frame = cv2.putText(frame, action, (bbox[0] + 5, bbox[1] + 15), cv2.FONT_HERSHEY_COMPLEX,
+                                        0.4, clr, 1)
 
             # frame = cv2.rectangle(frame, (bb_temp[0], bb_temp[1]), (bb_temp[2], bb_temp[3]), (0, 255, 0), 1) 
 
@@ -491,7 +385,7 @@ def run(source_path, model_path, out_dir="_ret",
                 sheet.append(res)
 
         if workbook != None:   
-            workbook.save(os.path.join(out_path, base_fn + ".xlsx"))
+            workbook.save(os.path.join(out_path, base_fn + "_results.xlsx"))
 
         # Clear resource.
         cam.stop()
@@ -521,7 +415,7 @@ if __name__ == '__main__':
 
     model_path = os.path.join(model_dir, base_fn+'.pth')
 
-    out_path = '_ret'
+    out_path = '_ret/fall'
 
     m_name = model_path.split('/')[-1].split('.')[0]
 
@@ -538,7 +432,7 @@ if __name__ == '__main__':
         print("skel mode err")
         exit()
 
-    skel = "test"
+    skel = "fallskel"
     skeldir = os.path.join(skeldir, skel)
 
     for i in range(len(video_list)):
