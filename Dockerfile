@@ -49,11 +49,11 @@ RUN pip install numpy==1.23.5
 # Install Fastapi Package
 RUN pip install fastapi uvicorn gunicorn starlette python-multipart==0.0.12
 
-# Set the default command to run when the container starts
-WORKDIR /app
-COPY falldown_module.zip .
-RUN unzip falldown_module.zip
-RUN rm falldown_module.zip
+## Set the default command to run when the container starts
+#WORKDIR /app
+#COPY falldown_module.zip .
+#RUN unzip falldown_module.zip
+#RUN rm falldown_module.zip
 
 # Start the FastAPI server using Gunicorn with Uvicorn workers
 CMD ["gunicorn", "--bind", "0:50004", "server:app", "--worker-class", "uvicorn.workers.UvicornWorker", "--timeout", "120"]
